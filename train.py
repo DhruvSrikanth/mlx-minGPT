@@ -79,7 +79,7 @@ class MLP(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, ctx_len: int):
         super().__init__()
-        assert n_embed % n_heads == 0
+        assert n_embed % n_heads == 0, f"n_embed ({n_embed}) must be divisible by n_heads ({n_heads})"
         # kqv projections for all heads
         self.c_kqv = nn.Linear(n_embed, 3 * n_embed, bias=bias)
         # output projection
@@ -254,14 +254,16 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
     return model, optimizer, train_losses, val_losses
 
 
+# ----------- Inference -----------
 def generate_completion(start: str, model: nn.Module, tokenizer: Tokenizer, max_new_tokens: int, temperature: float = 1.0) -> str:
-    # Shape (1, 1) -> B, T
+    # Shape (1, len(tokenizer.encode(start))) -> B, T
     start_ctx = mx.array([tokenizer.encode(start)])
     completion_tokens = model.generate(ctx=start_ctx, max_new_tokens=max_new_tokens, temperature=temperature)[0].tolist()
     completion = tokenizer.decode(completion_tokens)
     return completion
 
 
+# ----------- Main -----------
 def main(args: argparse.Namespace):
     # Set random seed
     mx.random.seed(args.seed)
@@ -295,10 +297,10 @@ if __name__ == "__main__":
     parser.add_argument('--seed', type=int, default=42)
 
     # ----------- Model Hyperparameters -----------
-    parser.add_argument('--ctx_len', type=int, default=128)
+    parser.add_argument('--ctx_len', type=int, default=256)
     parser.add_argument('--n_embed', type=int, default=512)
-    parser.add_argument('--n_heads', type=int, default=4)
-    parser.add_argument('--n_layers', type=int, default=4)
+    parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--bias', type=bool, default=True)
     parser.add_argument('--dropout', type=float, default=0.1)
 
@@ -309,7 +311,7 @@ if __name__ == "__main__":
 
     # ----------- Data Hyperparameters -----------
     parser.add_argument('--data_path', type=str, default='dataset.txt')
-    parser.add_argument('--train_val_split', type=float, default=0.8)
+    parser.add_argument('--train_val_split', type=float, default=0.9)
 
     # ----------- Save Path -----------
     parser.add_argument('--model_path', type=str, default='model.safetensors')
