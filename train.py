@@ -6,6 +6,9 @@ import numpy as np
 import math
 from rich.progress import Progress
 import argparse
+import os
+import uuid
+import glob
 
 
 # ----------- Tokenizer -----------
@@ -201,9 +204,11 @@ def loss_fn(m: nn.Module, xb: mx.array, yb: mx.array) -> mx.array:
 
 
 # ----------- Training -----------
-def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, num_epochs: int) -> tuple[nn.Module, optim.Optimizer, list[float], list[float]]:
-    train_losses = []
-    val_losses = []
+def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, num_epochs: int, tokenizer: Tokenizer, save_dir: str):
+    model_path = os.path.join(save_dir, 'model_{epoch}_{train_loss:.4f}_{val_loss:.4f}.safetensors')
+    optimizer_path = os.path.join(save_dir, 'optimizer_{epoch}.npy')
+    completion_path = os.path.join(save_dir, 'completion_{epoch}.txt')
+    session_id = save_dir.split('/')[-1]
 
     # Since MLX is lazy, we need to evaluate the model to set the initial state
     mx.eval(model.parameters())
@@ -214,16 +219,15 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
 
     # Training loop
     with Progress() as pbar:
-        epoch_task = pbar.add_task("[cyan]Training...", total=num_epochs)
+        epoch_task = pbar.add_task(f"[cyan] {session_id}", total=num_epochs)
         # Loop over epochs
         for epoch in range(num_epochs):
             # Loop through train and val
             train_loss = 0
             val_loss = 0
             for mode in ['train', 'val']:
-                batch_task_description = f"[green]Epoch {epoch} ({mode})..."
                 num_batches = (X_train.shape[0] if mode == 'train' else X_val.shape[0]) // batch_size
-                batch_task = pbar.add_task(batch_task_description, total=num_batches, transient=True)
+                batch_task = pbar.add_task(f"[green]Epoch {epoch} ({mode})...", total=num_batches, transient=True)
                 # Set model mode
                 model = model.train(mode == 'train')
                 running_loss = 0
@@ -251,9 +255,17 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                     train_loss = avg_loss
                 else:
                     val_loss = avg_loss
-            pbar.update(epoch_task, advance=1, description=f"[cyan]Epoch {epoch}/{num_epochs} | train = {train_loss:.4f} | val = {val_loss:.4f}")
 
-    return model, optimizer, train_losses, val_losses
+            # Save model and optimizer state
+            model.save_weights(model_path.format(epoch=epoch, train_loss=train_loss, val_loss=val_loss))
+            # mx.save(optimizer_path.format(epoch=epoch), optimizer.state)
+
+            # Generate and save completion
+            completion = generate_completion(start='\n', model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0)
+            with open(completion_path.format(epoch=epoch), 'w', encoding='utf-8') as f:
+                f.write(completion)
+
+            pbar.update(epoch_task, advance=1, description=f"[cyan]{session_id} | epoch {epoch}/{num_epochs} | train = {train_loss:.4f} | val = {val_loss:.4f}")
 
 
 # ----------- Inference -----------
@@ -268,12 +280,9 @@ def generate_completion(start: str, model: nn.Module, tokenizer: Tokenizer, max_
 
 # ----------- Main -----------
 def main(args: argparse.Namespace):
-    # validate arguments
-    assert any([args.model_path.endswith(ext) for ext in ['.safetensors', '.npz']]), "Model path must end with .safetensors or .npz"
-    assert args.optimizer_path.endswith('.npy'), "Optimizer path must end with .npy"
-    assert args.train_losses_path.endswith('.npy'), "Train losses path must end with .npy"
-    assert args.val_losses_path.endswith('.npy'), "Val losses path must end with .npy"
-    assert args.completion_path.endswith('.txt'), "Completion path must end with .txt"
+    # Create save directory if it doesn't exist with uuid
+    save_dir = os.path.join(args.save_dir, str(uuid.uuid4()))
+    os.makedirs(save_dir, exist_ok=True)
 
     # Set random seed
     mx.random.seed(args.seed)
@@ -292,18 +301,7 @@ def main(args: argparse.Namespace):
     model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len)
 
     # ----------- Train model -----------
-    model, optimizer, train_losses, val_losses = train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, num_epochs=args.num_epochs)
-
-    # Save model, optimizer state, train and val losses
-    model.save_weights(args.model_path)
-    mx.save(args.optimizer_path, optimizer.state)
-    np.save(args.train_losses_path, train_losses)
-    np.save(args.val_losses_path, val_losses)
-
-    # ----------- Inference -----------
-    completion = generate_completion(start='\n', model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
-    with open(args.completion_path, 'w', encoding='utf-8') as f:
-        f.write(completion)
+    train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, num_epochs=args.num_epochs, tokenizer=tokenizer, save_dir=save_dir)
 
 
 if __name__ == "__main__":
@@ -316,7 +314,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_heads', type=int, default=6)
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--bias', type=bool, default=False)
-    parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--dropout', type=float, default=0.0)
 
     # ----------- Training Hyperparameters -----------
     parser.add_argument('--num_epochs', type=int, default=100)
@@ -330,14 +328,6 @@ if __name__ == "__main__":
     parser.add_argument('--train_val_split', type=float, default=0.9)
 
     # ----------- Save Path -----------
-    parser.add_argument('--model_path', type=str, default='model.safetensors')
-    parser.add_argument('--optimizer_path', type=str, default='optimizer.npy')
-    parser.add_argument('--train_losses_path', type=str, default='train_losses.npy')
-    parser.add_argument('--val_losses_path', type=str, default='val_losses.npy')
-
-    # ----------- Inference Hyperparameters -----------
-    parser.add_argument('--max_new_tokens', type=int, default=500)
-    parser.add_argument('--temperature', type=float, default=1.0)
-    parser.add_argument('--completion_path', type=str, default='completions.txt')
+    parser.add_argument('--save_dir', type=str, default='.runs/')
 
     main(args=parser.parse_args())
