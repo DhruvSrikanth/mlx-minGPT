@@ -268,6 +268,13 @@ def generate_completion(start: str, model: nn.Module, tokenizer: Tokenizer, max_
 
 # ----------- Main -----------
 def main(args: argparse.Namespace):
+    # validate arguments
+    assert any([args.model_path.endswith(ext) for ext in ['.safetensors', '.npz']]), "Model path must end with .safetensors or .npz"
+    assert args.optimizer_path.endswith('.npy'), "Optimizer path must end with .npy"
+    assert args.train_losses_path.endswith('.npy'), "Train losses path must end with .npy"
+    assert args.val_losses_path.endswith('.npy'), "Val losses path must end with .npy"
+    assert args.completion_path.endswith('.txt'), "Completion path must end with .txt"
+
     # Set random seed
     mx.random.seed(args.seed)
     np.random.seed(args.seed)
@@ -286,8 +293,12 @@ def main(args: argparse.Namespace):
 
     # ----------- Train model -----------
     model, optimizer, train_losses, val_losses = train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, num_epochs=args.num_epochs)
-    # TODO: Save model and optimizer state
-    # TODO: Save train and val losses
+
+    # Save model, optimizer state, train and val losses
+    model.save_weights(args.model_path)
+    mx.save(args.optimizer_path, optimizer.state)
+    np.save(args.train_losses_path, train_losses)
+    np.save(args.val_losses_path, val_losses)
 
     # ----------- Inference -----------
     completion = generate_completion(start='\n', model=model, tokenizer=tokenizer, max_new_tokens=args.max_new_tokens, temperature=args.temperature)
@@ -320,7 +331,7 @@ if __name__ == "__main__":
 
     # ----------- Save Path -----------
     parser.add_argument('--model_path', type=str, default='model.safetensors')
-    parser.add_argument('--optimizer_path', type=str, default='optimizer.safetensors')
+    parser.add_argument('--optimizer_path', type=str, default='optimizer.npy')
     parser.add_argument('--train_losses_path', type=str, default='train_losses.npy')
     parser.add_argument('--val_losses_path', type=str, default='val_losses.npy')
 
