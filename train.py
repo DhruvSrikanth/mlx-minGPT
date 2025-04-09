@@ -185,6 +185,8 @@ class GPT(nn.Module):
             # Sample next token and add to context
             next_tok = mx.random.categorical(probs, num_samples=1)
             ctx = mx.concatenate((ctx, next_tok), axis=1)
+        # Since MLX is lazy, we need evaluate all operations performed on ctx
+        mx.eval(ctx)
         return ctx
 
 
@@ -199,7 +201,7 @@ def loss_fn(m: nn.Module, xb: mx.array, yb: mx.array) -> mx.array:
 
 
 # ----------- Training -----------
-def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, num_epochs: int) -> tuple[nn.Module, optim.Optimizer, list[float], list[float]]:
+def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, num_epochs: int) -> tuple[nn.Module, optim.Optimizer, list[float], list[float]]:
     train_losses = []
     val_losses = []
 
@@ -208,7 +210,7 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
     # Since MLX is pure, we need to define the forward and backward pass as a function
     loss_and_grad = nn.value_and_grad(model, loss_fn)
     # Build optimizer
-    optimizer = optim.AdamW(learning_rate=lr)
+    optimizer = optim.AdamW(learning_rate=lr, betas=betas, weight_decay=weight_decay)
 
     # Training loop
     with Progress() as pbar:
@@ -223,7 +225,7 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                 num_batches = (X_train.shape[0] if mode == 'train' else X_val.shape[0]) // batch_size
                 batch_task = pbar.add_task(batch_task_description, total=num_batches, transient=True)
                 # Set model mode
-                model.train(mode == 'train')
+                model = model.train(mode == 'train')
                 running_loss = 0
                 # Loop within dataset
                 for xb, yb in get_batches(X=X_train if mode == 'train' else X_val, y=y_train if mode == 'train' else y_val, batch_size=batch_size, shuffle=mode == 'train'):
@@ -256,6 +258,7 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
 
 # ----------- Inference -----------
 def generate_completion(start: str, model: nn.Module, tokenizer: Tokenizer, max_new_tokens: int, temperature: float = 1.0) -> str:
+    model = model.train(False)
     # Shape (1, len(tokenizer.encode(start))) -> B, T
     start_ctx = mx.array([tokenizer.encode(start)])
     completion_tokens = model.generate(ctx=start_ctx, max_new_tokens=max_new_tokens, temperature=temperature)[0].tolist()
@@ -282,7 +285,7 @@ def main(args: argparse.Namespace):
     model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len)
 
     # ----------- Train model -----------
-    model, optimizer, train_losses, val_losses = train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, num_epochs=args.num_epochs)
+    model, optimizer, train_losses, val_losses = train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, num_epochs=args.num_epochs)
     # TODO: Save model and optimizer state
     # TODO: Save train and val losses
 
@@ -298,16 +301,18 @@ if __name__ == "__main__":
 
     # ----------- Model Hyperparameters -----------
     parser.add_argument('--ctx_len', type=int, default=256)
-    parser.add_argument('--n_embed', type=int, default=512)
-    parser.add_argument('--n_heads', type=int, default=8)
+    parser.add_argument('--n_embed', type=int, default=384)
+    parser.add_argument('--n_heads', type=int, default=6)
     parser.add_argument('--n_layers', type=int, default=6)
-    parser.add_argument('--bias', type=bool, default=True)
-    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--bias', type=bool, default=False)
+    parser.add_argument('--dropout', type=float, default=0.2)
 
     # ----------- Training Hyperparameters -----------
-    parser.add_argument('--num_epochs', type=int, default=20)
+    parser.add_argument('--num_epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--betas', type=tuple[float, float], default=(0.9, 0.999))
+    parser.add_argument('--weight_decay', type=float, default=0.01)
 
     # ----------- Data Hyperparameters -----------
     parser.add_argument('--data_path', type=str, default='dataset.txt')
@@ -320,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument('--val_losses_path', type=str, default='val_losses.npy')
 
     # ----------- Inference Hyperparameters -----------
-    parser.add_argument('--max_new_tokens', type=int, default=1000)
+    parser.add_argument('--max_new_tokens', type=int, default=500)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--completion_path', type=str, default='completions.txt')
 
