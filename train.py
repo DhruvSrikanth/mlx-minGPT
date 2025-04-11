@@ -8,7 +8,7 @@ from rich.progress import Progress
 import argparse
 import os
 import uuid
-import glob
+import wandb
 
 
 # ----------- Tokenizer -----------
@@ -205,11 +205,6 @@ def loss_fn(m: nn.Module, xb: mx.array, yb: mx.array) -> mx.array:
 
 # ----------- Training -----------
 def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, num_epochs: int, tokenizer: Tokenizer, save_dir: str):
-    model_path = os.path.join(save_dir, 'model_{epoch}_{train_loss:.4f}_{val_loss:.4f}.safetensors')
-    optimizer_path = os.path.join(save_dir, 'optimizer_{epoch}.npy')
-    completion_path = os.path.join(save_dir, 'completion_{epoch}.txt')
-    session_id = save_dir.split('/')[-1]
-
     # Since MLX is lazy, we need to evaluate the model to set the initial state
     mx.eval(model.parameters())
     # Since MLX is pure, we need to define the forward and backward pass as a function
@@ -219,7 +214,7 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
 
     # Training loop
     with Progress() as pbar:
-        epoch_task = pbar.add_task(f"[cyan] {session_id}", total=num_epochs)
+        epoch_task = pbar.add_task("[cyan] Training...", total=num_epochs)
         # Loop over epochs
         for epoch in range(num_epochs):
             # Loop through train and val
@@ -232,7 +227,7 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                 model = model.train(mode == 'train')
                 running_loss = 0
                 # Loop within dataset
-                for xb, yb in get_batches(X=X_train if mode == 'train' else X_val, y=y_train if mode == 'train' else y_val, batch_size=batch_size, shuffle=mode == 'train'):
+                for step, (xb, yb) in enumerate(get_batches(X=X_train if mode == 'train' else X_val, y=y_train if mode == 'train' else y_val, batch_size=batch_size, shuffle=mode == 'train')):
                     if mode == 'train':
                         # Forward pass + backward pass
                         loss, grads = loss_and_grad(model, xb, yb)
@@ -246,6 +241,10 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                         # Since MLX is lazy, we need to evaluate the previous line's operations
                         mx.eval(loss)
                     running_loss += loss.item()
+
+                    # Update wandb
+                    wandb.log({f"{mode}_loss_step": loss.item()}, step=step)
+
                     pbar.update(batch_task, advance=1)
                 pbar.remove_task(batch_task)
 
@@ -256,16 +255,22 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                 else:
                     val_loss = avg_loss
 
-            # Save model and optimizer state
-            model.save_weights(model_path.format(epoch=epoch, train_loss=train_loss, val_loss=val_loss))
-            # mx.save(optimizer_path.format(epoch=epoch), optimizer.state)
+            # Update wandb
+            wandb.log({
+                "train_loss_epoch": train_loss,
+                "val_loss_epoch": val_loss
+            }, step=epoch)
+
+            # Save model
+            epoch_dir = os.path.join(save_dir, str(epoch))
+            os.makedirs(epoch_dir, exist_ok=True)
+            model.save_weights(os.path.join(epoch_dir, f'model_{train_loss:.4f}_{val_loss:.4f}.safetensors'))
 
             # Generate and save completion
-            completion = generate_completion(start='\n', model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0)
-            with open(completion_path.format(epoch=epoch), 'w', encoding='utf-8') as f:
-                f.write(completion)
+            with open(os.path.join(epoch_dir, 'completion.txt'), 'w', encoding='utf-8') as f:
+                f.write(generate_completion(start='\n', model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
 
-            pbar.update(epoch_task, advance=1, description=f"[cyan]{session_id} | epoch {epoch}/{num_epochs} | train = {train_loss:.4f} | val = {val_loss:.4f}")
+            pbar.update(epoch_task, advance=1, description=f"[cyan]epoch {epoch}/{num_epochs} | train = {train_loss:.4f} | val = {val_loss:.4f}")
 
 
 # ----------- Inference -----------
@@ -283,6 +288,14 @@ def main(args: argparse.Namespace):
     # Create save directory if it doesn't exist with uuid
     save_dir = os.path.join(args.save_dir, str(uuid.uuid4()))
     os.makedirs(save_dir, exist_ok=True)
+    print("Log dir: ", save_dir)
+
+    # Initialize wandb
+    wandb.init(
+        project="mlx-gpt",  # replace with your project name
+        name=f"run-{save_dir.split('/')[-1]}",
+        config=vars(args)
+    )
 
     # Set random seed
     mx.random.seed(args.seed)
@@ -299,6 +312,7 @@ def main(args: argparse.Namespace):
 
     # ----------- Build model -----------
     model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len)
+    print(f"Number of parameters: {(sum(v.size for _, v in utils.tree_flatten(model.parameters())) / 1e6):.2f}M")
 
     # ----------- Train model -----------
     train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, num_epochs=args.num_epochs, tokenizer=tokenizer, save_dir=save_dir)
@@ -314,13 +328,13 @@ if __name__ == "__main__":
     parser.add_argument('--n_heads', type=int, default=6)
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--bias', type=bool, default=False)
-    parser.add_argument('--dropout', type=float, default=0.0)
+    parser.add_argument('--dropout', type=float, default=0.2)
 
     # ----------- Training Hyperparameters -----------
-    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--num_epochs', type=int, default=500)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--betas', type=tuple[float, float], default=(0.9, 0.999))
+    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--betas', type=tuple[float, float], default=(0.9, 0.95))
     parser.add_argument('--weight_decay', type=float, default=0.01)
 
     # ----------- Data Hyperparameters -----------
