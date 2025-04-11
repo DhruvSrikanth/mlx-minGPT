@@ -5,6 +5,7 @@ import mlx.utils as utils
 import numpy as np
 import math
 from rich.progress import Progress
+from rich import print as rprint
 import argparse
 import os
 import uuid
@@ -204,7 +205,7 @@ def loss_fn(m: nn.Module, xb: mx.array, yb: mx.array) -> mx.array:
 
 
 # ----------- Training -----------
-def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, num_epochs: int, tokenizer: Tokenizer, save_dir: str):
+def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, steps: int, eval_frequency: int, tokenizer: Tokenizer, save_dir: str):
     # Since MLX is lazy, we need to evaluate the model to set the initial state
     mx.eval(model.parameters())
     # Since MLX is pure, we need to define the forward and backward pass as a function
@@ -212,65 +213,58 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
     # Build optimizer
     optimizer = optim.AdamW(learning_rate=lr, betas=betas, weight_decay=weight_decay)
 
+    train_data_iterator = iter(get_batches(X=X_train, y=y_train, batch_size=batch_size, shuffle=True))
+    val_data_iterator = iter(get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False))
+
     # Training loop
     with Progress() as pbar:
-        epoch_task = pbar.add_task("[cyan] Training...", total=num_epochs)
-        # Loop over epochs
-        for epoch in range(num_epochs):
-            # Loop through train and val
-            train_loss = 0
-            val_loss = 0
-            for mode in ['train', 'val']:
-                num_batches = (X_train.shape[0] if mode == 'train' else X_val.shape[0]) // batch_size
-                batch_task = pbar.add_task(f"[green]Epoch {epoch} ({mode})...", total=num_batches, transient=True)
-                # Set model mode
-                model = model.train(mode == 'train')
-                running_loss = 0
-                # Loop within dataset
-                for step, (xb, yb) in enumerate(get_batches(X=X_train if mode == 'train' else X_val, y=y_train if mode == 'train' else y_val, batch_size=batch_size, shuffle=mode == 'train')):
-                    if mode == 'train':
-                        # Forward pass + backward pass
-                        loss, grads = loss_and_grad(model, xb, yb)
-                        # Update parameters and optimizer state
-                        optimizer.update(model, grads)
-                        # Since MLX is lazy, we need to evaluate the previous line's operations
-                        mx.eval(model.parameters(), optimizer.state)
-                    else:
-                        # Forward pass
-                        loss = loss_fn(m=model, xb=xb, yb=yb)
-                        # Since MLX is lazy, we need to evaluate the previous line's operations
-                        mx.eval(loss)
-                    running_loss += loss.item()
+        task = pbar.add_task("[cyan] Training...", total=steps)
+        for step in range(steps):
+            # Get the data to train
+            try:
+                xb, yb = next(train_data_iterator)
+            except StopIteration:
+                train_data_iterator = iter(get_batches(X=X_train, y=y_train, batch_size=batch_size, shuffle=True))
+                xb, yb = next(train_data_iterator)
 
-                    # Update wandb
-                    wandb.log({f"{mode}_loss_step": loss.item()}, step=step)
+            # -------- Training --------
+            # Set model to training mode
+            model = model.train()
+            # Forward pass + backward pass
+            loss, grads = loss_and_grad(model, xb, yb)
+            # Update parameters and optimizer state
+            optimizer.update(model, grads)
+            # Since MLX is lazy, we need to evaluate the previous line's operations
+            mx.eval(model.parameters(), optimizer.state)
+            # Log loss
+            wandb.log({"train_loss": loss.item()}, step=step)
 
-                    pbar.update(batch_task, advance=1)
-                pbar.remove_task(batch_task)
+            # -------- Validation --------
+            if step % eval_frequency == 0:
+                # Get the data to validate
+                try:
+                    xb, yb = next(val_data_iterator)
+                except StopIteration:
+                    val_data_iterator = iter(get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False))
+                    xb, yb = next(val_data_iterator)
+                # Set model to evaluation mode
+                model = model.train(False)
+                # Forward pass
+                loss = loss_fn(m=model, xb=xb, yb=yb)
+                # Since MLX is lazy, we need to evaluate the previous line's operations
+                mx.eval(loss)
+                wandb.log({"val_loss": loss.item()}, step=step)
 
-                # Compute average loss
-                avg_loss = running_loss / num_batches
-                if mode == 'train':
-                    train_loss = avg_loss
-                else:
-                    val_loss = avg_loss
+                # Save model
+                step_dir = os.path.join(save_dir, str(step))
+                os.makedirs(step_dir, exist_ok=True)
+                model.save_weights(os.path.join(step_dir, 'model.safetensors'))
 
-            # Update wandb
-            wandb.log({
-                "train_loss_epoch": train_loss,
-                "val_loss_epoch": val_loss
-            }, step=epoch)
+                # Generate and save completion
+                with open(os.path.join(step_dir, 'completion.txt'), 'w', encoding='utf-8') as f:
+                    f.write(generate_completion(start="To be or not to be,", model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
 
-            # Save model
-            epoch_dir = os.path.join(save_dir, str(epoch))
-            os.makedirs(epoch_dir, exist_ok=True)
-            model.save_weights(os.path.join(epoch_dir, f'model_{train_loss:.4f}_{val_loss:.4f}.safetensors'))
-
-            # Generate and save completion
-            with open(os.path.join(epoch_dir, 'completion.txt'), 'w', encoding='utf-8') as f:
-                f.write(generate_completion(start='\n', model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
-
-            pbar.update(epoch_task, advance=1, description=f"[cyan]epoch {epoch}/{num_epochs} | train = {train_loss:.4f} | val = {val_loss:.4f}")
+            pbar.update(task, advance=1, description=f"[cyan]step {step}/{steps}")
 
 
 # ----------- Inference -----------
@@ -285,10 +279,11 @@ def generate_completion(start: str, model: nn.Module, tokenizer: Tokenizer, max_
 
 # ----------- Main -----------
 def main(args: argparse.Namespace):
+    assert args.steps > args.eval_frequency, f"steps ({args.steps}) must be greater than eval_frequency ({args.eval_frequency})"
+
     # Create save directory if it doesn't exist with uuid
     save_dir = os.path.join(args.save_dir, str(uuid.uuid4()))
     os.makedirs(save_dir, exist_ok=True)
-    print("Log dir: ", save_dir)
 
     # Initialize wandb
     wandb.init(
@@ -312,10 +307,13 @@ def main(args: argparse.Namespace):
 
     # ----------- Build model -----------
     model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len)
-    print(f"Number of parameters: {(sum(v.size for _, v in utils.tree_flatten(model.parameters())) / 1e6):.2f}M")
+
+    # Print Summary
+    rprint(f"Log dir:[bold blue underline]{save_dir}[/bold blue underline]")
+    rprint(f"Number of parameters: [bold green]{(sum(v.size for _, v in utils.tree_flatten(model.parameters())) / 1e6):.2f}M[/bold green]")
 
     # ----------- Train model -----------
-    train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, num_epochs=args.num_epochs, tokenizer=tokenizer, save_dir=save_dir)
+    train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, steps=args.steps, eval_frequency=args.eval_frequency, tokenizer=tokenizer, save_dir=save_dir)
 
 
 if __name__ == "__main__":
@@ -331,11 +329,12 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.2)
 
     # ----------- Training Hyperparameters -----------
-    parser.add_argument('--num_epochs', type=int, default=500)
+    parser.add_argument('--steps', type=int, default=5000)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--betas', type=tuple[float, float], default=(0.9, 0.95))
     parser.add_argument('--weight_decay', type=float, default=0.01)
+    parser.add_argument('--eval_frequency', type=int, default=200)
 
     # ----------- Data Hyperparameters -----------
     parser.add_argument('--data_path', type=str, default='dataset.txt')
