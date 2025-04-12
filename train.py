@@ -214,7 +214,6 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
     optimizer = optim.AdamW(learning_rate=lr, betas=betas, weight_decay=weight_decay)
 
     train_data_iterator = iter(get_batches(X=X_train, y=y_train, batch_size=batch_size, shuffle=True))
-    val_data_iterator = iter(get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False))
 
     # Training loop
     with Progress() as pbar:
@@ -241,19 +240,16 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
 
             # -------- Validation --------
             if step % eval_frequency == 0:
-                # Get the data to validate
-                try:
-                    xb, yb = next(val_data_iterator)
-                except StopIteration:
-                    val_data_iterator = iter(get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False))
-                    xb, yb = next(val_data_iterator)
-                # Set model to evaluation mode
-                model = model.train(False)
-                # Forward pass
-                loss = loss_fn(m=model, xb=xb, yb=yb)
-                # Since MLX is lazy, we need to evaluate the previous line's operations
-                mx.eval(loss)
-                wandb.log({"val_loss": loss.item()}, step=step)
+                val_loss = 0.0
+                for xb, yb in get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False):
+                    # Set model to evaluation mode
+                    model = model.train(False)
+                    # Forward pass
+                    loss = loss_fn(m=model, xb=xb, yb=yb)
+                    # Since MLX is lazy, we need to evaluate the previous line's operations
+                    mx.eval(loss)
+                    val_loss += loss.item()
+                wandb.log({"val_loss": val_loss / (math.ceil(len(X_val) / batch_size))}, step=step)
 
                 # Save model
                 step_dir = os.path.join(save_dir, str(step))
@@ -309,8 +305,8 @@ def main(args: argparse.Namespace):
     model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len)
 
     # Print Summary
-    rprint(f"Log dir:[bold blue underline]{save_dir}[/bold blue underline]")
-    rprint(f"Number of parameters: [bold green]{(sum(v.size for _, v in utils.tree_flatten(model.parameters())) / 1e6):.2f}M[/bold green]")
+    rprint(f"Log dir:[blue underline]{save_dir}[/blue underline]")
+    rprint(f"Number of parameters: [yellow]{(sum(v.size for _, v in utils.tree_flatten(model.parameters())) / 1e6):.2f}M[/yellow]")
 
     # ----------- Train model -----------
     train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, steps=args.steps, eval_frequency=args.eval_frequency, tokenizer=tokenizer, save_dir=save_dir)
