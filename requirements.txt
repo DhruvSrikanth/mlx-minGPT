@@ -1,3 +1,4 @@
 rich
 numpy
 mlx
+wandb

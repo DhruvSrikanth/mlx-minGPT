@@ -172,3 +172,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Mac files
+.DS_Store
+
+# Logs
+.runs/
+wandb/

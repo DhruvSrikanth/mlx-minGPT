@@ -1,15 +1,15 @@
+import uuid
+import os
+import argparse
+import math
+import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import mlx.utils as utils
-import numpy as np
-import math
+import wandb
 from rich.progress import Progress
 from rich import print as rprint
-import argparse
-import os
-import uuid
-import wandb
 
 
 # ----------- Tokenizer -----------
@@ -178,19 +178,20 @@ class GPT(nn.Module):
         return self.lm_head(x)
 
     def generate(self, ctx: mx.array, max_new_tokens: int, temperature: float = 1.0) -> mx.array:
-        # Add max_new_tokens to ctx
+        # Set the eval mode
+        self.train(False)
         for _ in range(max_new_tokens):
             # Crop context to most recent ctx_len tokens
-            ctx = ctx[:, -self.ctx_len:]
+            lm_ctx = ctx[:, -self.ctx_len:]
             # Get the probabilities of the next token
             # B, T, C -> B, -1, C
-            logits = self(ctx)[:, -1, :]
-            probs = mx.softmax(logits / temperature, axis=-1)
+            logits = self(lm_ctx)[:, -1, :]
+            # NOTE: For some reason, softmax does not work here...not sure why
+            # probs = mx.softmax(logits / temperature, axis=-1)
+            probs = logits / temperature
             # Sample next token and add to context
             next_tok = mx.random.categorical(probs, num_samples=1)
             ctx = mx.concatenate((ctx, next_tok), axis=1)
-        # Since MLX is lazy, we need evaluate all operations performed on ctx
-        mx.eval(ctx)
         return ctx
 
 
@@ -205,7 +206,7 @@ def loss_fn(m: nn.Module, xb: mx.array, yb: mx.array) -> mx.array:
 
 
 # ----------- Training -----------
-def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, steps: int, eval_frequency: int, tokenizer: Tokenizer, save_dir: str):
+def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array, batch_size: int, model: nn.Module, lr: float, betas: tuple[float, float], weight_decay: float, max_grad_norm: float, steps: int, eval_frequency: int, tokenizer: Tokenizer, save_dir: str, log: bool) -> nn.Module:
     # Since MLX is lazy, we need to evaluate the model to set the initial state
     mx.eval(model.parameters())
     # Since MLX is pure, we need to define the forward and backward pass as a function
@@ -231,15 +232,19 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
             model = model.train()
             # Forward pass + backward pass
             loss, grads = loss_and_grad(model, xb, yb)
+            # Perform gradient clipping
+            clipped_grads, _ = optim.clip_grad_norm(grads=grads, max_norm=max_grad_norm)
             # Update parameters and optimizer state
-            optimizer.update(model, grads)
+            optimizer.update(model, clipped_grads)
             # Since MLX is lazy, we need to evaluate the previous line's operations
             mx.eval(model.parameters(), optimizer.state)
-            # Log loss
-            wandb.log({"train_loss": loss.item()}, step=step)
+
+            if log:
+                wandb.log({"train_loss": loss.item()}, step=step)
 
             # -------- Validation --------
-            if step % eval_frequency == 0:
+            # Evaluate every eval_frequency steps and at the last step as well
+            if step % eval_frequency == 0 or step == steps - 1:
                 val_loss = 0.0
                 for xb, yb in get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False):
                     # Set model to evaluation mode
@@ -249,23 +254,26 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                     # Since MLX is lazy, we need to evaluate the previous line's operations
                     mx.eval(loss)
                     val_loss += loss.item()
-                wandb.log({"val_loss": val_loss / (math.ceil(len(X_val) / batch_size))}, step=step)
 
-                # Save model
-                step_dir = os.path.join(save_dir, str(step))
-                os.makedirs(step_dir, exist_ok=True)
-                model.save_weights(os.path.join(step_dir, 'model.safetensors'))
+                if log:
+                    wandb.log({"val_loss": val_loss / (math.ceil(len(X_val) / batch_size))}, step=step)
 
-                # Generate and save completion
-                with open(os.path.join(step_dir, 'completion.txt'), 'w', encoding='utf-8') as f:
-                    f.write(generate_completion(start="To be or not to be,", model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
+                    # Save model
+                    step_dir = os.path.join(save_dir, str(step))
+                    os.makedirs(step_dir, exist_ok=True)
+                    model.save_weights(os.path.join(step_dir, 'model.safetensors'))
+
+                    # Generate and save completion
+                    with open(os.path.join(step_dir, 'completion.txt'), 'w', encoding='utf-8') as f:
+                        f.write(generate_completion(start="To be or not to be,", model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
 
             pbar.update(task, advance=1, description=f"[cyan]step {step}/{steps}")
+
+    return model
 
 
 # ----------- Inference -----------
 def generate_completion(start: str, model: nn.Module, tokenizer: Tokenizer, max_new_tokens: int, temperature: float = 1.0) -> str:
-    model = model.train(False)
     # Shape (1, len(tokenizer.encode(start))) -> B, T
     start_ctx = mx.array([tokenizer.encode(start)])
     completion_tokens = model.generate(ctx=start_ctx, max_new_tokens=max_new_tokens, temperature=temperature)[0].tolist()
@@ -282,11 +290,12 @@ def main(args: argparse.Namespace):
     os.makedirs(save_dir, exist_ok=True)
 
     # Initialize wandb
-    wandb.init(
-        project="mlx-gpt",  # replace with your project name
-        name=f"run-{save_dir.split('/')[-1]}",
-        config=vars(args)
-    )
+    if args.log:
+        wandb.init(
+            project="mlx-gpt",  # replace with your project name
+            name=f"run-{save_dir.split('/')[-1]}",
+            config=vars(args)
+        )
 
     # Set random seed
     mx.random.seed(args.seed)
@@ -309,34 +318,40 @@ def main(args: argparse.Namespace):
     rprint(f"Number of parameters: [yellow]{(sum(v.size for _, v in utils.tree_flatten(model.parameters())) / 1e6):.2f}M[/yellow]")
 
     # ----------- Train model -----------
-    train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, steps=args.steps, eval_frequency=args.eval_frequency, tokenizer=tokenizer, save_dir=save_dir)
+    trained_model = train(X_train=X_train, y_train=y_train, X_val=X_val, y_val=y_val, batch_size=args.batch_size, model=model, lr=args.lr, betas=args.betas, weight_decay=args.weight_decay, max_grad_norm=args.max_grad_norm, steps=args.steps, eval_frequency=args.eval_frequency, tokenizer=tokenizer, save_dir=save_dir, log=args.log)
+
+    # ----------- Generate completion -----------
+    print(generate_completion(start="To be or not to be,", model=trained_model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--seed', type=int, default=42)
 
+    # ----------- Data Hyperparameters -----------
+    parser.add_argument('--data_path', type=str, default='dataset.txt')
+    parser.add_argument('--train_val_split', type=float, default=0.9)
+
     # ----------- Model Hyperparameters -----------
-    parser.add_argument('--ctx_len', type=int, default=256)
+    parser.add_argument('--ctx_len', type=int, default=8)
     parser.add_argument('--n_embed', type=int, default=384)
     parser.add_argument('--n_heads', type=int, default=6)
     parser.add_argument('--n_layers', type=int, default=6)
-    parser.add_argument('--bias', type=bool, default=False)
+    parser.add_argument('--bias', type=bool, default=True)
     parser.add_argument('--dropout', type=float, default=0.2)
 
     # ----------- Training Hyperparameters -----------
     parser.add_argument('--steps', type=int, default=5000)
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--betas', type=tuple[float, float], default=(0.9, 0.95))
-    parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--eval_frequency', type=int, default=200)
+    parser.add_argument('--weight_decay', type=float, default=0.1)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    parser.add_argument('--eval_frequency', type=int, default=250)
 
-    # ----------- Data Hyperparameters -----------
-    parser.add_argument('--data_path', type=str, default='dataset.txt')
-    parser.add_argument('--train_val_split', type=float, default=0.9)
-
-    # ----------- Save Path -----------
+    # ----------- Logging Parameters -----------
+    parser.add_argument('--log', type=bool, default=True)
     parser.add_argument('--save_dir', type=str, default='.runs/')
 
+    # ----------- Run -----------
     main(args=parser.parse_args())

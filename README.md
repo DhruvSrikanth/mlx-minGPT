@@ -6,7 +6,7 @@ A minimal implementation of GPT in mlx.
 
 ```bash
 pip install -r requirements.txt
-python tf_train.py
+python train.py
 ```
 
 
