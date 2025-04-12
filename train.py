@@ -186,8 +186,7 @@ class GPT(nn.Module):
             # Get the probabilities of the next token
             # B, T, C -> B, -1, C
             logits = self(lm_ctx)[:, -1, :]
-            # NOTE: For some reason, softmax does not work here...not sure why
-            # probs = mx.softmax(logits / temperature, axis=-1)
+            # Unnormalized probabilities adjusted by temperature
             probs = logits / temperature
             # Sample next token and add to context
             next_tok = mx.random.categorical(probs, num_samples=1)
