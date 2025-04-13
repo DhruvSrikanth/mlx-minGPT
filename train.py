@@ -228,7 +228,7 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
 
             # -------- Training --------
             # Set model to training mode
-            model = model.train()
+            model = model.train(True)
             # Forward pass + backward pass
             loss, grads = loss_and_grad(model, xb, yb)
             # Perform gradient clipping
@@ -237,25 +237,28 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
             optimizer.update(model, clipped_grads)
             # Since MLX is lazy, we need to evaluate the previous line's operations
             mx.eval(model.parameters(), optimizer.state)
+            train_loss = loss.item()
 
             if log:
-                wandb.log({"train_loss": loss.item()}, step=step)
+                wandb.log({"train_loss": train_loss}, step=step)
 
             # -------- Validation --------
             # Evaluate every eval_frequency steps and at the last step as well
+            val_loss = 0.0
             if step % eval_frequency == 0 or step == steps - 1:
-                val_loss = 0.0
+                # Set model to evaluation mode
+                model = model.train(False)
                 for xb, yb in get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False):
-                    # Set model to evaluation mode
-                    model = model.train(False)
                     # Forward pass
-                    loss = loss_fn(m=model, xb=xb, yb=yb)
+                    val_loss = loss_fn(m=model, xb=xb, yb=yb)
                     # Since MLX is lazy, we need to evaluate the previous line's operations
-                    mx.eval(loss)
-                    val_loss += loss.item()
+                    mx.eval(val_loss)
+
+                # Compute average validation loss over all batches
+                val_loss = val_loss.item() / (math.ceil(len(X_val) / batch_size))
 
                 if log:
-                    wandb.log({"val_loss": val_loss / (math.ceil(len(X_val) / batch_size))}, step=step)
+                    wandb.log({"val_loss": val_loss}, step=step)
 
                     # Save model
                     step_dir = os.path.join(save_dir, str(step))
@@ -263,10 +266,11 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
                     model.save_weights(os.path.join(step_dir, 'model.safetensors'))
 
                     # Generate and save completion
+                    completion = generate_completion(start="To be or not to be,", model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0)
                     with open(os.path.join(step_dir, 'completion.txt'), 'w', encoding='utf-8') as f:
-                        f.write(generate_completion(start="To be or not to be,", model=model, tokenizer=tokenizer, max_new_tokens=1000, temperature=1.0))
+                        f.write(completion)
 
-            pbar.update(task, advance=1, description=f"[cyan]step {step}/{steps}")
+            pbar.update(task, advance=1, description=f"[cyan]Step {step}/{steps} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
     return model
 
