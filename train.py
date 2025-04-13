@@ -10,6 +10,7 @@ import mlx.utils as utils
 import wandb
 from rich.progress import Progress
 from rich import print as rprint
+from typing import Union
 
 
 # ----------- Tokenizer -----------
@@ -81,7 +82,7 @@ class MLP(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, ctx_len: int):
+    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int):
         super().__init__()
         assert n_embed % n_heads == 0, f"n_embed ({n_embed}) must be divisible by n_heads ({n_heads})"
         # kqv projections for all heads
@@ -93,10 +94,8 @@ class MultiHeadAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = n_embed // self.n_heads
         self.sqrt_d = math.sqrt(self.head_dim)
-        # Causal mask for all heads (1, 1, ctx_len, ctx_len)
-        self.causal_mask = mx.tril(x=mx.ones((ctx_len, ctx_len)), k=0)[None, None, :, :]
 
-    def __call__(self, x):
+    def __call__(self, x, mask: Union[mx.array, None] = None):
         B, T, C = x.shape  # batch size, sequence length, embedding dimension
         # Project x to K, Q, V for all heads
         K, Q, V = mx.split(self.c_kqv(x), indices_or_sections=3, axis=2)
@@ -107,8 +106,9 @@ class MultiHeadAttention(nn.Module):
         # Attention = softmax((Q K^T / sqrt(d)) with mask)
         # B, n_heads, T, head_dim @ B, n_heads, head_dim, T -> B, n_heads, T, T
         A = ((Q @ K.transpose(0, 1, 3, 2)) / self.sqrt_d)
-        # Apply mask
-        A = mx.where(self.causal_mask[:, :, :T, :T] == 0, -np.inf, A)
+        # Apply mask if required
+        if mask is not None:
+            A = mx.where(mask[:, :, :T, :T] == 0, -np.inf, A)
         A_norm = mx.softmax(A, axis=-1)
         A_norm = self.attn_dropout(A_norm)
         # B, n_heads, T, T @ B, n_heads, T, head_dim -> B, n_heads, T, head_dim
@@ -121,16 +121,16 @@ class MultiHeadAttention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, ctx_len: int):
+    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int):
         super().__init__()
         self.norm_1 = nn.LayerNorm(dims=n_embed, bias=bias)
-        self.attention = MultiHeadAttention(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads, ctx_len=ctx_len)
+        self.attention = MultiHeadAttention(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
         self.norm_2 = nn.LayerNorm(dims=n_embed, bias=bias)
         self.mlp = MLP(n_embed=n_embed, dropout=dropout, bias=bias)
 
-    def __call__(self, x):
-        x = x + self.attention(self.norm_1(x))
-        x = x + self.mlp(self.norm_2(x))
+    def __call__(self, x, mask: Union[mx.array, None] = None):
+        x = x + self.attention(x=self.norm_1(x), mask=mask)
+        x = x + self.mlp(x=self.norm_2(x))
         return x
 
 
@@ -146,7 +146,7 @@ class GPT(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # Transformer blocks
         self.blocks = nn.Sequential(*[
-            Block(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads, ctx_len=self.ctx_len)
+            Block(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
             for _ in range(n_layers)
         ])
         # n_embed -> vocab_size
@@ -173,7 +173,9 @@ class GPT(nn.Module):
         tok_emb = self.wte(x)
         pos_emb = self.wpe(mx.arange(start=0, stop=T, step=1, dtype=mx.int32))
         x = self.dropout(tok_emb + pos_emb)
-        x = self.blocks(x)
+        # Create causal mask
+        mask = mx.tril(mx.ones((T, T)))[None, None, :, :]
+        x = self.blocks(x=x, mask=mask)
         x = self.ln_f(x)
         return self.lm_head(x)
 
