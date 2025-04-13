@@ -145,10 +145,10 @@ class GPT(nn.Module):
         # Embedding dropout
         self.dropout = nn.Dropout(dropout)
         # Transformer blocks
-        self.blocks = nn.Sequential(*[
+        self.blocks = [
             Block(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
             for _ in range(n_layers)
-        ])
+        ]
         # n_embed -> vocab_size
         self.ln_f = nn.LayerNorm(dims=n_embed, bias=bias)
         self.lm_head = nn.Linear(n_embed, vocab_size, bias=bias)
@@ -170,13 +170,18 @@ class GPT(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         T = x.shape[1]
         assert T <= self.ctx_len, f"Sequence length {T} exceeds context length {self.ctx_len}"
+        # Token and position embeddings
         tok_emb = self.wte(x)
         pos_emb = self.wpe(mx.arange(start=0, stop=T, step=1, dtype=mx.int32))
         x = self.dropout(tok_emb + pos_emb)
         # Create causal mask
         mask = mx.tril(mx.ones((T, T)))[None, None, :, :]
-        x = self.blocks(x=x, mask=mask)
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x, mask)
+        # Normalize
         x = self.ln_f(x)
+        # Project to vocab size
         return self.lm_head(x)
 
     def generate(self, ctx: mx.array, max_new_tokens: int, temperature: float = 1.0) -> mx.array:
@@ -347,13 +352,13 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.2)
 
     # ----------- Training Hyperparameters -----------
-    parser.add_argument('--steps', type=int, default=5000)
+    parser.add_argument('--steps', type=int, default=10000)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--betas', type=tuple[float, float], default=(0.9, 0.95))
     parser.add_argument('--weight_decay', type=float, default=0.1)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
-    parser.add_argument('--eval_frequency', type=int, default=250)
+    parser.add_argument('--eval_frequency', type=int, default=500)
 
     # ----------- Logging Parameters -----------
     parser.add_argument('--log', type=bool, default=True)
