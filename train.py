@@ -85,24 +85,31 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int):
         super().__init__()
         assert n_embed % n_heads == 0, f"n_embed ({n_embed}) must be divisible by n_heads ({n_heads})"
+        self.n_heads = n_heads
+        # dimension of each head
+        self.head_dim = n_embed // self.n_heads
+        # precompute sqrt(d)
+        self.sqrt_d = math.sqrt(self.head_dim)
         # kqv projections for all heads
         self.c_kqv = nn.Linear(n_embed, 3 * n_embed, bias=bias)
         # output projection
         self.c_proj = nn.Linear(n_embed, n_embed, bias=bias)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
-        self.n_heads = n_heads
-        self.head_dim = n_embed // self.n_heads
-        self.sqrt_d = math.sqrt(self.head_dim)
 
     def __call__(self, x, mask: Union[mx.array, None] = None):
-        B, T, C = x.shape  # batch size, sequence length, embedding dimension
-        # Project x to K, Q, V for all heads
+        # batch size, sequence length, embedding dimension
+        B, T, C = x.shape
+
+        # --- prepare keys, queries and values ---
+        # project x to K, Q, V for all heads
         K, Q, V = mx.split(self.c_kqv(x), indices_or_sections=3, axis=2)
         # B, T, C -> B, T, n_heads, head_dim -> B, n_heads, T, head_dim
         K = mx.as_strided(K, (B, T, self.n_heads, self.head_dim)).transpose(0, 2, 1, 3)
         Q = mx.as_strided(Q, (B, T, self.n_heads, self.head_dim)).transpose(0, 2, 1, 3)
         V = mx.as_strided(V, (B, T, self.n_heads, self.head_dim)).transpose(0, 2, 1, 3)
+
+        # --- scaled dot-product attention ---
         # Attention = softmax((Q K^T / sqrt(d)) with mask)
         # B, n_heads, T, head_dim @ B, n_heads, head_dim, T -> B, n_heads, T, T
         A = ((Q @ K.transpose(0, 1, 3, 2)) / self.sqrt_d)
@@ -113,18 +120,86 @@ class MultiHeadAttention(nn.Module):
         A_norm = self.attn_dropout(A_norm)
         # B, n_heads, T, T @ B, n_heads, T, head_dim -> B, n_heads, T, head_dim
         y = A_norm @ V
+
+        # --- combine heads and project output ---
         # B, n_heads, T, head_dim -> B, T, n_heads, head_dim -> B, T, C (reassemble heads)
         y = mx.contiguous(y.transpose(0, 2, 1, 3)).reshape((B, T, C))
-        # Project y back to output space
+        # project y back to output space
         y = self.c_proj(self.resid_dropout(y))
         return y
 
 
-class Block(nn.Module):
+class MultiQueryAttention(nn.Module):
     def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int):
         super().__init__()
+        assert n_embed % n_heads == 0, f"n_embed ({n_embed}) must be divisible by n_heads ({n_heads})"
+        self.n_heads = n_heads
+        self.head_dim = n_embed // self.n_heads
+        self.sqrt_d = math.sqrt(self.head_dim)
+
+        # query projection (per head)
+        self.c_q = nn.Linear(n_embed, n_embed, bias=bias)
+        # key/value projection (shared)
+        self.c_kv = nn.Linear(n_embed, 2 * self.head_dim, bias=bias)
+        # output projection
+        self.c_proj = nn.Linear(n_embed, n_embed, bias=bias)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def __call__(self, x, mask: Union[mx.array, None] = None):
+        # batch size, sequence length, embedding dimension
+        B, T, C = x.shape
+
+        # --- compute query, key, value ---
+        # Q: B, T, C -> B, T, n_embed -> B, T, n_heads, head_dim -> B, n_heads, T, head_dim
+        Q = self.c_q(x)
+        Q = mx.as_strided(Q, (B, T, self.n_heads, self.head_dim)).transpose(0, 2, 1, 3)
+        # K, V: B, T, C -> B, T, head_dim
+        K, V = mx.split(self.c_kv(x), indices_or_sections=2, axis=2)
+        # B, T, head_dim -> B, 1, T, head_dim
+        K = mx.as_strided(K, (B, 1, T, self.head_dim))
+        V = mx.as_strided(V, (B, 1, T, self.head_dim))
+
+        # --- scaled dot-product attention ---
+        # Attention = softmax((Q K^T / sqrt(d)) with mask)
+        # B, n_heads, T, head_dim @ B, 1, head_dim, T -> B, n_heads, T, T
+        # K is broadcast across the head dimension
+        A = (Q @ K.transpose(0, 1, 3, 2)) / self.sqrt_d
+        # Apply mask if required
+        if mask is not None:
+            A = mx.where(mask[:, :, :T, :T] == 0, -np.inf, A)
+        A_norm = mx.softmax(A, axis=-1)
+        A_norm = self.attn_dropout(A_norm)
+        # B, n_heads, T, T @ B, 1, T, head_dim -> B, n_heads, T, head_dim
+        # V is broadcast across the head dimension
+        y = A_norm @ V
+
+        # --- combine heads and project output ---
+        # B, n_heads, T, head_dim -> B, T, n_heads, head_dim -> B, T, C (reassemble heads)
+        y = mx.contiguous(y.transpose(0, 2, 1, 3)).reshape((B, T, C))
+        # project y back to output space
+        y = self.c_proj(self.resid_dropout(y))
+        return y
+
+
+class GroupQueryAttention(nn.Module):
+    pass
+
+
+class Block(nn.Module):
+    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, attention_mechanism: str):
+        super().__init__()
+        # determine which attention mechanism to use
+        allowed_attention_mechanisms = {
+            'MHA': MultiHeadAttention,
+            'MQA': MultiQueryAttention,
+            'GQA': GroupQueryAttention
+        }
+        assert attention_mechanism in allowed_attention_mechanisms, f"attention_mechanism ({attention_mechanism}) must be one of {list(allowed_attention_mechanisms.keys())}"
+        # initialize layers
         self.norm_1 = nn.LayerNorm(dims=n_embed, bias=bias)
-        self.attention = MultiHeadAttention(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
+        self.attention = allowed_attention_mechanisms[attention_mechanism](n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
         self.norm_2 = nn.LayerNorm(dims=n_embed, bias=bias)
         self.mlp = MLP(n_embed=n_embed, dropout=dropout, bias=bias)
 
@@ -135,18 +210,18 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, n_embed: int, bias: bool, dropout: float, n_heads: int, n_layers: int, ctx_len: int):
+    def __init__(self, vocab_size: int, n_embed: int, bias: bool, dropout: float, n_heads: int, n_layers: int, ctx_len: int, attention_mechanism: str):
         super().__init__()
         self.ctx_len = ctx_len
-        # Token and position embeddings
+        # token and position embeddings
         # vocab_size -> n_embed
         self.wte = nn.Embedding(vocab_size, n_embed)
         self.wpe = nn.Embedding(self.ctx_len, n_embed)
-        # Embedding dropout
+        # embedding dropout
         self.dropout = nn.Dropout(dropout)
-        # Transformer blocks
+        # transformer blocks
         self.blocks = [
-            Block(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
+            Block(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads, attention_mechanism=attention_mechanism)
             for _ in range(n_layers)
         ]
         # n_embed -> vocab_size
@@ -251,7 +326,6 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
 
             # -------- Validation --------
             # Evaluate every eval_frequency steps and at the last step as well
-            val_loss = 0.0
             if step % eval_frequency == 0 or step == steps - 1:
                 # Set model to evaluation mode
                 model = model.train(False)
@@ -322,7 +396,7 @@ def main(args: argparse.Namespace):
     X_train, y_train, X_val, y_val = split_data(raw_text=raw_text, tokenizer=tokenizer, train_val_split=args.train_val_split, ctx_len=args.ctx_len)
 
     # ----------- Build model -----------
-    model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len)
+    model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len, attention_mechanism=args.attention_mechanism)
 
     # Print Summary
     rprint(f"Log dir:[blue underline]{save_dir}[/blue underline]")
@@ -350,6 +424,7 @@ if __name__ == "__main__":
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--bias', type=bool, default=True)
     parser.add_argument('--dropout', type=float, default=0.2)
+    parser.add_argument('--attention_mechanism', type=str, default='MHA', choices=['MHA', 'MQA'])
 
     # ----------- Training Hyperparameters -----------
     parser.add_argument('--steps', type=int, default=10000)
