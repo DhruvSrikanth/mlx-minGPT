@@ -248,9 +248,10 @@ def train(X_train: mx.array, y_train: mx.array, X_val: mx.array, y_val: mx.array
             if step % eval_frequency == 0 or step == steps - 1:
                 # Set model to evaluation mode
                 model = model.train(False)
+                val_loss = 0.0
                 for xb, yb in get_batches(X=X_val, y=y_val, batch_size=batch_size, shuffle=False):
                     # Forward pass
-                    val_loss = loss_fn(m=model, xb=xb, yb=yb)
+                    val_loss += loss_fn(m=model, xb=xb, yb=yb)
                     # Since MLX is lazy, we need to evaluate the previous line's operations
                     mx.eval(val_loss)
 
