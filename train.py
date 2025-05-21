@@ -184,11 +184,62 @@ class MultiQueryAttention(nn.Module):
 
 
 class GroupQueryAttention(nn.Module):
-    pass
+    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, n_query_groups: int):
+        super().__init__()
+        assert n_heads % n_query_groups == 0, (
+            f"n_heads ({n_heads}) must be divisible by n_query_groups ({n_query_groups})"
+        )
+        assert n_embed % n_heads == 0, (
+            f"n_embed ({n_embed}) must be divisible by n_heads ({n_heads})"
+        )
+
+        self.n_heads = n_heads
+        self.n_query_groups = n_query_groups
+        self.head_dim = n_embed // self.n_heads
+        self.sqrt_d = math.sqrt(self.head_dim)
+
+        # query projection per head
+        self.c_q = nn.Linear(n_embed, n_embed, bias=bias)
+        # key/value projection per group
+        self.c_kv = nn.Linear(n_embed, 2 * self.n_query_groups * self.head_dim, bias=bias)
+        # output projection
+        self.c_proj = nn.Linear(n_embed, n_embed, bias=bias)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+
+    def __call__(self, x, mask: Union[mx.array, None] = None):
+        B, T, C = x.shape
+
+        # --- compute query, key, value ---
+        Q = self.c_q(x)
+        Q = mx.as_strided(Q, (B, T, self.n_heads, self.head_dim)).transpose(0, 2, 1, 3)
+
+        K, V = mx.split(self.c_kv(x), indices_or_sections=2, axis=2)
+        K = mx.as_strided(K, (B, T, self.n_query_groups, self.head_dim)).transpose(0, 2, 1, 3)
+        V = mx.as_strided(V, (B, T, self.n_query_groups, self.head_dim)).transpose(0, 2, 1, 3)
+
+        if self.n_query_groups != self.n_heads:
+            group_size = self.n_heads // self.n_query_groups
+            K = mx.repeat(K, repeats=group_size, axis=1)
+            V = mx.repeat(V, repeats=group_size, axis=1)
+
+        # --- scaled dot-product attention ---
+        A = (Q @ K.transpose(0, 1, 3, 2)) / self.sqrt_d
+        if mask is not None:
+            A = mx.where(mask[:, :, :T, :T] == 0, -np.inf, A)
+        A_norm = mx.softmax(A, axis=-1)
+        A_norm = self.attn_dropout(A_norm)
+        y = A_norm @ V
+
+        # --- combine heads and project output ---
+        y = mx.contiguous(y.transpose(0, 2, 1, 3)).reshape((B, T, C))
+        y = self.c_proj(self.resid_dropout(y))
+        return y
 
 
 class Block(nn.Module):
-    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, attention_mechanism: str):
+    def __init__(self, n_embed: int, bias: bool, dropout: float, n_heads: int, attention_mechanism: str, n_query_groups: int = 1):
         super().__init__()
         # determine which attention mechanism to use
         allowed_attention_mechanisms = {
@@ -199,7 +250,22 @@ class Block(nn.Module):
         assert attention_mechanism in allowed_attention_mechanisms, f"attention_mechanism ({attention_mechanism}) must be one of {list(allowed_attention_mechanisms.keys())}"
         # initialize layers
         self.norm_1 = nn.LayerNorm(dims=n_embed, bias=bias)
-        self.attention = allowed_attention_mechanisms[attention_mechanism](n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads)
+        AttentionClass = allowed_attention_mechanisms[attention_mechanism]
+        if attention_mechanism == 'GQA':
+            self.attention = AttentionClass(
+                n_embed=n_embed,
+                bias=bias,
+                dropout=dropout,
+                n_heads=n_heads,
+                n_query_groups=n_query_groups,
+            )
+        else:
+            self.attention = AttentionClass(
+                n_embed=n_embed,
+                bias=bias,
+                dropout=dropout,
+                n_heads=n_heads,
+            )
         self.norm_2 = nn.LayerNorm(dims=n_embed, bias=bias)
         self.mlp = MLP(n_embed=n_embed, dropout=dropout, bias=bias)
 
@@ -210,7 +276,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, n_embed: int, bias: bool, dropout: float, n_heads: int, n_layers: int, ctx_len: int, attention_mechanism: str):
+    def __init__(self, vocab_size: int, n_embed: int, bias: bool, dropout: float, n_heads: int, n_layers: int, ctx_len: int, attention_mechanism: str, n_query_groups: int = 1):
         super().__init__()
         self.ctx_len = ctx_len
         # token and position embeddings
@@ -221,7 +287,14 @@ class GPT(nn.Module):
         self.dropout = nn.Dropout(dropout)
         # transformer blocks
         self.blocks = [
-            Block(n_embed=n_embed, bias=bias, dropout=dropout, n_heads=n_heads, attention_mechanism=attention_mechanism)
+            Block(
+                n_embed=n_embed,
+                bias=bias,
+                dropout=dropout,
+                n_heads=n_heads,
+                attention_mechanism=attention_mechanism,
+                n_query_groups=n_query_groups,
+            )
             for _ in range(n_layers)
         ]
         # n_embed -> vocab_size
@@ -396,7 +469,17 @@ def main(args: argparse.Namespace):
     X_train, y_train, X_val, y_val = split_data(raw_text=raw_text, tokenizer=tokenizer, train_val_split=args.train_val_split, ctx_len=args.ctx_len)
 
     # ----------- Build model -----------
-    model = GPT(vocab_size=tokenizer.vocab_size, n_embed=args.n_embed, bias=args.bias, dropout=args.dropout, n_heads=args.n_heads, n_layers=args.n_layers, ctx_len=args.ctx_len, attention_mechanism=args.attention_mechanism)
+    model = GPT(
+        vocab_size=tokenizer.vocab_size,
+        n_embed=args.n_embed,
+        bias=args.bias,
+        dropout=args.dropout,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        ctx_len=args.ctx_len,
+        attention_mechanism=args.attention_mechanism,
+        n_query_groups=args.n_query_groups,
+    )
 
     # Print Summary
     rprint(f"Log dir:[blue underline]{save_dir}[/blue underline]")
@@ -424,7 +507,8 @@ if __name__ == "__main__":
     parser.add_argument('--n_layers', type=int, default=6)
     parser.add_argument('--bias', type=bool, default=True)
     parser.add_argument('--dropout', type=float, default=0.2)
-    parser.add_argument('--attention_mechanism', type=str, default='MHA', choices=['MHA', 'MQA'])
+    parser.add_argument('--attention_mechanism', type=str, default='MHA', choices=['MHA', 'MQA', 'GQA'])
+    parser.add_argument('--n_query_groups', type=int, default=1)
 
     # ----------- Training Hyperparameters -----------
     parser.add_argument('--steps', type=int, default=10000)
